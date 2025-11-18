@@ -4,11 +4,8 @@
 #include <string>
 #include <atomic>
 #include <map>
-#include <chrono>
-#include <algorithm>
-#include <fstream>
-#include <mutex>
-#include <iomanip>
+#include <chrono> // For timestamps and sleep
+#include <algorithm> // For std::sort
 
 // Linux/POSIX-specific for CPU pinning
 #ifdef __linux__
@@ -17,417 +14,262 @@
 
 using namespace std;
 
-// === Configuration Parameters ===
-struct Config {
-    size_t RING_BUFFER_CAPACITY = 1024;
-    uint64_t WINDOW_SIZE_MS = 10;
-    uint64_t WATERMARK_DELAY_MS = 5;
-    uint64_t PROCESSOR_CAPACITY = 200;
-    uint64_t TEST_DURATION_SEC = 30;
-    bool ENABLE_LOGGING = false;  // Disabled for Windows compatibility
-    string LOG_FILE = "performance.log";
-};
-
-// Global config
-Config g_config;
-
-// === Performance Statistics ===
-struct PerformanceStats {
-    atomic<uint64_t> total_windows_published{0};
-    atomic<uint64_t> total_events_processed{0};
-    atomic<uint64_t> total_events_skipped{0};
-    chrono::steady_clock::time_point start_time{};
-    mutex log_mutex;
-    ofstream* log_file{nullptr};
-
-    PerformanceStats() = default;
-    ~PerformanceStats() {
-        if (log_file && log_file->is_open()) {
-            log_file->close();
-            delete log_file;
-        }
-    }
-
-    void start() {
-        start_time = chrono::steady_clock::now();
-        if (g_config.ENABLE_LOGGING) {
-            log_file = new ofstream(g_config.LOG_FILE, ios::out);
-            *log_file << "timestamp_ms,thread,event,value,details\n";
-        }
-    }
-
-    void log(const string& thread_name, const string& event, uint64_t value, const string& details = "") {
-        if (!g_config.ENABLE_LOGGING || !log_file) return;
-
-        lock_guard<mutex> lock(log_mutex);
-        auto now = chrono::steady_clock::now();
-        auto elapsed_ms = chrono::duration_cast<chrono::milliseconds>(now - start_time).count();
-
-        *log_file << elapsed_ms << "," << thread_name << "," << event << ","
-                 << value << "," << details << "\n";
-    }
-
-    void print_summary() {
-        auto end_time = chrono::steady_clock::now();
-        auto duration_sec = chrono::duration_cast<chrono::seconds>(end_time - start_time).count();
-
-        cout << "\n=== Performance Summary ===\n";
-        cout << "Test Duration: " << duration_sec << " seconds\n";
-        cout << "Ring Buffer Capacity: " << g_config.RING_BUFFER_CAPACITY << "\n";
-        cout << "Window Size: " << g_config.WINDOW_SIZE_MS << " ms\n";
-        cout << "Watermark Delay: " << g_config.WATERMARK_DELAY_MS << " ms\n";
-        cout << "Processor Capacity: " << g_config.PROCESSOR_CAPACITY << "\n";
-        cout << "Total Windows Published: " << total_windows_published.load() << "\n";
-        cout << "Total Events Processed: " << total_events_processed.load() << "\n";
-        cout << "Total Events Skipped: " << total_events_skipped.load() << "\n";
-        cout << "Throughput: " << (total_windows_published.load() / (double)duration_sec) << " windows/sec\n";
-        cout << "Event Processing Rate: " << (total_events_processed.load() / (double)duration_sec) << " events/sec\n";
-
-        if (g_config.ENABLE_LOGGING && log_file) {
-            log_file->flush();
-            log_file->close();
-            cout << "Performance log saved to: " << g_config.LOG_FILE << "\n";
-        }
-    }
-};
-
-PerformanceStats g_stats;
-
-// === Processor Statistics (for latency tracking) ===
-struct ProcStats {
-    uint64_t total_snapshots = 0;
-    uint64_t latency_sum = 0;
-    uint64_t latency_min = UINT64_MAX;
-    uint64_t latency_max = 0;
-};
-
-// --- 1. Data structure definitions ---
-// Clean Order Book data sent by Validator(Task 1) to KDS
+// --- 1. 데이터 구조체 정의 ---
+// Validator(Task 1)가 KDS로 보낸 Clean Order Book 데이터
 struct CleanData {
-    uint64_t ts_event; // Event occurrence time (Watermark basis)
-    string exchange;
+   uint64_t ts_event; // 이벤트 발생 시각 (Watermark 기준)
+   string exchange;
 
-    // (Simplified orderbook: actually uses map<price, size>)
-    map<double, double> bids;
-    map<double, double> asks;
+   // (간소화된 오더북: 실제로는 map<price, size> 사용)
+   map<double, double> bids;
+   map<double, double> asks;
 
-    // (Fake data for KDS simulation)
-    static CleanData create_fake(string ex, uint64_t ts) {
-        return { ts, ex, {{101.5, 10.0}}, {{102.0, 5.0}} };
-    }
+   // (KDS 시뮬레이션을 위한 가짜 데이터)
+   static CleanData create_fake(string ex, uint64_t ts) {
+       return { ts, ex, {{101.5, 10.0}}, {{102.0, 5.0}} };
+   }
 };
 
-// Global snapshot to be published by Aggregator
+// Aggregator가 최종 발행(Publish)할 글로벌 스냅샷
 struct MergedOrderBook {
-    uint64_t window_start_time;
-    // [ [price, size, exchange], ... ]
-    vector<tuple<double, double, string>> global_bids;
-    vector<tuple<double, double, string>> global_asks;
+   uint64_t window_start_time;
+   // [ [price, size, exchange], ... ]
+   vector<tuple<double, double, string>> global_bids;
+   vector<tuple<double, double, string>> global_asks;
 };
 
 
-// --- 2. NRT Ring Buffer ---
-template<typename T>
+// --- 2. NRT 링 버퍼 ---
+template<typename T, size_t Capacity>
 class NrtRingBuffer {
 public:
-    // Capacity should be a power of 2 (e.g., 1024)
-    NrtRingBuffer(size_t capacity) : write_cursor_(0), buffer_(capacity), capacity_(capacity) {}
+   // Capacity는 2의 거듭제곱이어야 함 (예: 1024)
+   NrtRingBuffer() : write_cursor_(0), buffer_(Capacity), capacity_(Capacity) {}
 
-    // Called only by Reader thread (Producer)
-    void push(const T& item) {
-        const uint64_t seq = write_cursor_.load(memory_order_relaxed);
-        buffer_[seq % capacity_] = item;
-        write_cursor_.store(seq + 1, memory_order_release);
-    }
+   // Reader 스레드(Producer)만 호출
+   void push(const T& item) {
+       const uint64_t seq = write_cursor_.load(memory_order_relaxed);
+       buffer_[seq % capacity_] = item;
+       write_cursor_.store(seq + 1, memory_order_release);
+   }
 
-    uint64_t get_latest_cursor() const {
-        return write_cursor_.load(memory_order_acquire);
-    }
+   uint64_t get_latest_cursor() const {
+       return write_cursor_.load(memory_order_acquire);
+   }
 
-    const T& at(uint64_t seq) const {
-        return buffer_[seq % capacity_];
-    }
-
-    // Rarely needed as data is typically not modified
-    T& at(uint64_t seq) {
-        return buffer_[seq % capacity_];
-    }
+   const T& at(uint64_t seq) const {
+       return buffer_[seq % capacity_];
+   }
+   
+   // 데이터를 수정할 일이 사실상 없어서 거의 필요 없을듯
+   T& at(uint64_t seq) {
+       return buffer_[seq % capacity_];
+   }
 
 private:
-    // C++17: use alignas instead of hardcoding cacheline_size
-    // uint64_t overflow would take ~500 years
-    alignas(64) atomic<uint64_t> write_cursor_;
-
-    vector<T> buffer_;
-    const size_t capacity_;
+   // C++17: cacheline_size를 하드코딩하는 대신 alignas 사용
+   // uint64_t라 오버플로우 나려면 500걸림
+   alignas(64) atomic<uint64_t> write_cursor_;
+   
+   vector<T> buffer_;
+   const size_t capacity_;
 };
 
-// --- 3. CPU pinning helper function ---
+// --- 3. CPU 피닝 헬퍼 함수 ---
 void set_thread_affinity(thread& th, int core_id) {
 #ifdef __linux__
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(core_id, &cpuset); // Set pinning info
+   cpu_set_t cpuset;
+   CPU_ZERO(&cpuset);
+   CPU_SET(core_id, &cpuset); // 피닝 정보 설정
 
-    int rc = pthread_setaffinity_np(th.native_handle(), sizeof(cpu_set_t), &cpuset); // Actual pinning
-    if (rc != 0) {
-        cerr << "Error setting thread affinity for core " << core_id << ": " << rc << endl;
-    }
-    else {
-        cout << "Successfully pinned thread " << th.get_id() << " to CPU core " << core_id << endl;
-    }
+   int rc = pthread_setaffinity_np(th.native_handle(), sizeof(cpu_set_t), &cpuset); // 실제 피닝
+   if (rc != 0) {
+       cerr << "Error setting thread affinity for core " << core_id << ": " << rc << endl;
+   }
+   else {
+       cout << "Successfully pinned thread " << th.get_id() << " to CPU core " << core_id << endl;
+   }
 #else
-    cout << "Warning: CPU pinning is only supported on Linux. Thread " << th.get_id() << " is NOT pinned." << endl;
+   cout << "Warning: CPU pinning is only supported on Linux. Thread " << th.get_id() << " is NOT pinned." << endl;
 #endif
 }
 
-// --- 4. Thread logic (Reader & Processor) ---
+// --- 4. 스레드 로직 (Reader & Processor) ---
 void reader_thread_func(
-    const string& product_name,
-    NrtRingBuffer<CleanData>& buffer,
-    atomic<bool>& running)
+   const string& product_name,
+   NrtRingBuffer<CleanData, 1024>& buffer,
+   atomic<bool>& running)
 {
-    cout << "[Reader-" << product_name << "] started." << endl;
+   cout << "[Reader-" << p
+roduct_name << "] 시작." << endl;
 
-    uint64_t events_pushed = 0;
-    while (running) {
-        // 1. Fetch data from KDS (simulation)
-        uint64_t now_ms = chrono::duration_cast<chrono::milliseconds>(
-            chrono::system_clock::now().time_since_epoch()).count();
+   while (running) {
+       // 1. KDS에서 데이터 가져오기 (시뮬레이션)
+       uint64_t now_ms = chrono::duration_cast<chrono::milliseconds>(
+           chrono::system_clock::now().time_since_epoch()).count();
 
-        CleanData fake_binance = CleanData::create_fake("binance", now_ms - 10);
-        CleanData fake_coinbase = CleanData::create_fake("coinbase", now_ms - 20);
+       CleanData fake_binance = CleanData::create_fake("binance", now_ms - 10);
+       CleanData fake_coinbase = CleanData::create_fake("coinbase", now_ms - 20);
 
-        buffer.push(fake_binance);
-        buffer.push(fake_coinbase);
-        events_pushed += 2;
+       buffer.push(fake_binance);
+       buffer.push(fake_coinbase);
 
-        // Intentional time interval (5ms)
-        this_thread::sleep_for(chrono::milliseconds(5));
-    }
-
-    g_stats.log(product_name, "reader_total_pushed", events_pushed);
+       // 의도적 시간 간격(5ms)
+       this_thread::sleep_for(chrono::milliseconds(5));
+   }
 }
 
 void processor_thread_func(
-    const string& product_name,
-    NrtRingBuffer<CleanData>& buffer,
-    atomic<bool>& running,
-    ProcStats& stats)
+   const string& product_name,
+   NrtRingBuffer<CleanData, 1024>& buffer,
+   atomic<bool>& running)
 {
-    cout << "[Processor-" << product_name << "] started." << endl;
+   cout << "[Processor-" << product_name << "] 시작." << endl;
 
-    uint64_t my_last_processed_seq = buffer.get_latest_cursor();
+   const uint64_t WINDOW_SIZE_MS = 10;
+   const uint64_t WATERMARK_DELAY_MS = 5;
+   
+   const uint64_t BUFFER_CAPACITY = 1024;
+   const uint64_t MY_CAPACITY = 200;
 
-    // --- Window logic variables ---
-    uint64_t max_event_time_seen = 0;
-    uint64_t current_window_start = 0;
-    map<uint64_t, vector<CleanData>> window_buffers;
-    map<string, map<double, double>> current_bids;
-    map<string, map<double, double>> current_asks;
+   uint64_t my_last_proces
+sed_seq = buffer.get_latest_cursor();
 
-    uint64_t windows_published = 0;
-    uint64_t events_processed = 0;
-    uint64_t events_skipped = 0;
+   // --- 기존 윈도우 로직용 변수 (변경 없음) ---
+   uint64_t max_event_time_seen = 0;
+   uint64_t current_window_start = 0;
+   map<uint64_t, vector<CleanData>> window_buffers;
+   map<string, map<double, double>> current_bids;
+   map<string, map<double, double>> current_asks;
 
-    while (running) {
-        const uint64_t latest_available_seq = buffer.get_latest_cursor();
+   while (running) {
+       const uint64_t latest_available_seq = buffer.get_latest_cursor();
 
-        if (latest_available_seq <= my_last_processed_seq) {
-            // Nothing to process (busy waiting)
-            continue;
-        }
+       if (latest_available_seq <= my_last_processed_seq) {
+           // 처리할 것 없음(busy waiting)
+           continue;
+       }
 
-        // "Skip" logic
-        const uint64_t seq_to_end = latest_available_seq;
-        uint64_t seq_to_start = my_last_processed_seq + 1;
+       // "건너뛰기" 로직
+       const uint64_t seq_to_end = latest_available_seq;
+       uint64_t seq_to_start = my_last_processed_seq + 1;
 
-        seq_to_start = max(seq_to_start,
-                           (seq_to_end > g_config.PROCESSOR_CAPACITY) ? (seq_to_end - g_config.PROCESSOR_CAPACITY + 1) : 0);
+       seq_to_start = max(seq_to_start,
+                          (seq_to_end > MY_CAPACITY) ? (seq_to_end - MY_CAPACITY + 1) : 0);
 
-        // Count skipped events
-        if (seq_to_start > my_last_processed_seq + 1) {
-            uint64_t skipped = seq_to_start - (my_last_processed_seq + 1);
-            events_skipped += skipped;
-            g_stats.total_events_skipped.fetch_add(skipped);
-        }
+       // 처리 가능한 배치 만큼 처리
+       for (uint64_t i = seq_to_start; i <= seq_to_end; i++) {
+           const CleanData& data = buf
+fer.at(i);
 
-        // Process batch
-        for (uint64_t i = seq_to_start; i <= seq_to_end; i++) {
-            const CleanData& data = buffer.at(i);
-            events_processed++;
+           // --- (이하는 기존 try_pop 루프 내부와 동일) ---
+           // 2. 워터마크 업데이트
+           if (data.ts_event > max_event_time_seen) {
+               max_event_time_seen = data.ts_event;
+           }
 
-            // 2. Update watermark
-            if (data.ts_event > max_event_time_seen) {
-                max_event_time_seen = data.ts_event;
-            }
+           // 3. 윈도우 배정 (10ms 단위)
+           uint64_t window = (data.ts_event / WINDOW_SIZE_MS) * WINDOW_SIZE_MS;
+           window_buffers[window].push_back(data);
+           // --- (여기까지 기존 로직과 동일) ---
+       }
+       
+       my_last_processed_seq = seq_to_end;
 
-            // 3. Assign to window (configurable window size)
-            uint64_t window = (data.ts_event / g_config.WINDOW_SIZE_MS) * g_config.WINDOW_SIZE_MS;
-            window_buffers[window].push_back(data);
-        }
+       // --- (이하는 기존 Processor 로직과 완전히 동일) ---
 
-        my_last_processed_seq = seq_to_end;
+       // 4. 워터마크 계산
+       uint64_t watermark = (max_event_time_seen > WATERMARK_DELAY_MS) ? (max_event_time_seen - WATERMARK_DELAY_MS) : 0;
 
-        // 4. Calculate watermark
-        uint64_t watermark = (max_event_time_seen > g_config.WATERMARK_DELAY_MS) ?
-                             (max_event_time_seen - g_config.WATERMARK_DELAY_MS) : 0;
+       if (current_window_start == 0 && !window_buffers.empty()) {
+           current_window_start = window_buffers.begin()->first;
+       }
 
-        if (current_window_start == 0 && !window_buffers.empty()) {
-            current_window_start = window_buffers.begin()->first;
-        }
+       // 5. 윈도우 마감 및 처리
+       while (watermark > current_window_start + WINDOW_SIZE_MS
+) {
+           
+           vector<CleanData>& events_to_process = window_buffers[current_window_start];
 
-        // 5. Close and process windows
-        while (watermark > current_window_start + g_config.WINDOW_SIZE_MS) {
+           // 5a. 이벤트 적용 (메모리 상태 업데이트 - 래치 효과)
+           for (const auto& evt : events_to_process) {
+               current_bids[evt.exchange] = evt.bids; // (최신 데이터로 덮어써짐)
+               current_asks[evt.exchange] = evt.asks;
+           }
 
-            vector<CleanData>& events_to_process = window_buffers[current_window_start];
+           // 5b. 글로벌 오더북(스냅샷) 생성
+           MergedOrderBook snapshot;
+           snapshot.window_start_time = current_window_start;
 
-            // 5a. Apply events (update memory state - latch effect)
-            for (const auto& evt : events_to_process) {
-                current_bids[evt.exchange] = evt.bids; // (Overwritten with latest data)
-                current_asks[evt.exchange] = evt.asks;
-            }
+           for (auto const& [exchange, book] : current_bids) {
+               for (auto const& [price, size] : book) {
+                   snapshot.global_bids.emplace_back(price, size, exchange);
+               }
+           }
+           sort(snapshot.global_bids.rbegin(), snapshot.global_bids.rend());
 
-            // 5b. Create global orderbook (snapshot)
-            MergedOrderBook snapshot;
-            snapshot.window_start_time = current_window_start;
+           // 5c. 최종 발행 (Publish)
+           if (!snapshot.global_bids.empty()) {
+               cout << "? [Processor-" << product_
+name << "] Window " << current_window_start << " 발행! (최고 매수가: "
+                    << get<0>(snapshot.global_bids[0]) << " / " << get<2>(snapshot.global_bids[0]) << ")" << endl;
+           }
+           
+           // 5d. 처리 완료된 윈도우 삭제
+           window_buffers.erase(current_window_start);
+           current_window_start += WINDOW_SIZE_MS;
+       }
 
-            for (auto const& [exchange, book] : current_bids) {
-                for (auto const& [price, size] : book) {
-                    snapshot.global_bids.emplace_back(price, size, exchange);
-                }
-            }
-            sort(snapshot.global_bids.rbegin(), snapshot.global_bids.rend());
-
-            // 5c. Final publish + Latency measurement
-            if (!snapshot.global_bids.empty()) {
-                // Publish timestamp
-                uint64_t publish_time_ms = chrono::duration_cast<chrono::milliseconds>(
-                    chrono::system_clock::now().time_since_epoch()).count();
-
-                // Latency = now - window_start_time
-                uint64_t latency = publish_time_ms - snapshot.window_start_time;
-
-                // Update stats
-                stats.total_snapshots++;
-                stats.latency_sum += latency;
-                stats.latency_min = min(stats.latency_min, latency);
-                stats.latency_max = max(stats.latency_max, latency);
-
-                windows_published++;
-                g_stats.total_windows_published.fetch_add(1);
-
-                cout << "✓ [Processor-" << product_name << "] Window " << current_window_start
-                     << " latency=" << latency << "ms"
-                     << " (Top bid: " << get<0>(snapshot.global_bids[0])
-                     << " / " << get<2>(snapshot.global_bids[0]) << ")" << endl;
-
-                g_stats.log(product_name, "window_published", current_window_start,
-                           "latency=" + to_string(latency) + "ms,top_bid=" + to_string(get<0>(snapshot.global_bids[0])));
-            }
-
-            // 5d. Delete processed window
-            window_buffers.erase(current_window_start);
-            current_window_start += g_config.WINDOW_SIZE_MS;
-        }
-
-        // (Prevent CPU busy-wait)
-        if (window_buffers.empty()) {
-            this_thread::sleep_for(chrono::milliseconds(1));
-        }
-    }
-
-    g_stats.total_events_processed.fetch_add(events_processed);
-    g_stats.log(product_name, "processor_events_processed", events_processed);
-    g_stats.log(product_name, "processor_events_skipped", events_skipped);
-    g_stats.log(product_name, "processor_windows_published", windows_published);
+       // (CPU Busy-wait 방지. 기존 로직과 동일)
+       if (window_buffers.empty()) {
+           this_thread::sleep_for(chrono::milliseconds(1));
+       }
+   }
 }
 
 
-// --- 5. Main function (run 6 threads with pinning) ---
-int main(int argc, char* argv[]) {
-    // Parse command-line arguments
-    if (argc > 1) g_config.RING_BUFFER_CAPACITY = stoull(argv[1]);
-    if (argc > 2) g_config.WINDOW_SIZE_MS = stoull(argv[2]);
-    if (argc > 3) g_config.WATERMARK_DELAY_MS = stoull(argv[3]);
-    if (argc > 4) g_config.PROCESSOR_CAPACITY = stoull(argv[4]);
-    if (argc > 5) g_config.TEST_DURATION_SEC = stoull(argv[5]);
+// --- 5. 메인 함수 (스레드 6개 실행 및 피닝) ---
+int main() {
+   cout << "Aggregator 시작... (LMAX NRT 패턴, 4-코어 비대칭 피닝)" << endl;
 
-    cout << "Aggregator starting... (LMAX NRT pattern, 4-core asymmetric pinning)" << endl;
-    cout << "Config: buffer=" << g_config.RING_BUFFER_CAPACITY
-         << " window=" << g_config.WINDOW_SIZE_MS << "ms"
-         << " watermark=" << g_config.WATERMARK_DELAY_MS << "ms"
-         << " proc_cap=" << g_config.PROCESSOR_CAPACITY
-         << " duration=" << g_config.TEST_DURATION_SEC << "s" << endl;
-    cout.flush();
+   atomic<bool> running(true);
 
-    g_stats.start();
-    cout << "Stats initialized" << endl;
-    cout.flush();
-    atomic<bool> running(true);
+   // 3개의 NRT 링 버퍼 (공유 버퍼) 생성
+   NrtRingBuffer<CleanData, 1024> buffer_abc;
+   NrtRingBuffer<CleanData, 1024> buffer_xyz;
+   NrtRingBuffer<CleanData, 1024> buffer_foo;
 
-    // Create stats structures for latency tracking
-    ProcStats stats_abc, stats_xyz, stats_foo;
+   // --- 스레드 생성 (변경 없음) ---//I.O Intensive                             //CPU Intensive
+   thread reader_abc(reader_thread_f
+unc, "ABC", ref(buffer_abc), ref(running));
+   thread reader_xyz(reader_thread_func, "XYZ", ref(buffer_xyz), ref(running));
+   thread reader_foo(reader_thread_func, "FOO", ref(buffer_foo), ref(running));
 
-    // Create 3 NRT ring buffers (shared buffers)
-    cout << "Creating buffers..." << endl;
-    NrtRingBuffer<CleanData> buffer_abc(g_config.RING_BUFFER_CAPACITY);
-    NrtRingBuffer<CleanData> buffer_xyz(g_config.RING_BUFFER_CAPACITY);
-    NrtRingBuffer<CleanData> buffer_foo(g_config.RING_BUFFER_CAPACITY);
-    cout << "Buffers created" << endl;
-    cout.flush();
+   thread processor_abc(processor_thread_func, "ABC", ref(buffer_abc), ref(running));
+   thread processor_xyz(processor_thread_func, "XYZ", ref(buffer_xyz), ref(running));
+   thread processor_foo(processor_thread_func, "FOO", ref(buffer_foo), ref(running));
 
-    // --- Create threads ---//I.O Intensive                             //CPU Intensive
-    cout << "Creating threads..." << endl;
-    thread reader_abc(reader_thread_func, "ABC", ref(buffer_abc), ref(running));
-    thread reader_xyz(reader_thread_func, "XYZ", ref(buffer_xyz), ref(running));
-    thread reader_foo(reader_thread_func, "FOO", ref(buffer_foo), ref(running));
+   // --- CPU 피닝 (변경 없음) ---
+   set_thread_affinity(reader_abc, 2); //Because three readers are I.O intensive ,pin them to same core
+   set_thread_affinity(reader_xyz, 2);
+   set_thread_affinity(reader_foo, 2);
 
-    thread processor_abc(processor_thread_func, "ABC", ref(buffer_abc), ref(running), ref(stats_abc));
-    thread processor_xyz(processor_thread_func, "XYZ", ref(buffer_xyz), ref(running), ref(stats_xyz));
-    thread processor_foo(processor_thread_func, "FOO", ref(buffer_foo), ref(running), ref(stats_foo));
+   set_thread_affinity(processor_abc, 3);
+   set_thread_affinity(processor_xyz, 4);
+   set_thread_affinity(processor_foo, 5);
+    // IRQ, CPU Isolation is necessary.
+   // 30초간 실행 (테스트용)
+   this_thread::sleep_for(chrono::seconds(30));
 
-    // --- CPU pinning ---
-    set_thread_affinity(reader_abc, 2); //Because three readers are I.O intensive, pin them to same core
-    set_thread_affinity(reader_xyz, 2);
-    set_thread_affinity(reader_foo, 2);
+   running = false; // 스레드 종료 신호
 
-    set_thread_affinity(processor_abc, 3);
-    set_thread_affinity(processor_xyz, 4);
-    set_thread_affinity(processor_foo, 5);
+   reader_abc.join();
+   reader_xyz.join();
+   reader_foo.join();
+   processor_abc.join();
+   processor_xyz.join();
+   processor_foo.join();
 
-    // Run for configured duration (test)
-    this_thread::sleep_for(chrono::seconds(g_config.TEST_DURATION_SEC));
-
-    running = false; // Signal threads to terminate
-
-    reader_abc.join();
-    reader_xyz.join();
-    reader_foo.join();
-    processor_abc.join();
-    processor_xyz.join();
-    processor_foo.join();
-
-    cout << "Aggregator terminated." << endl;
-
-    // Print latency statistics for each processor
-    auto print_stats = [](const string& name, const ProcStats& s) {
-        cout << "\n=== Latency Stats for " << name << " ===\n";
-        cout << "Total snapshots : " << s.total_snapshots << "\n";
-
-        if (s.total_snapshots > 0) {
-            double avg = static_cast<double>(s.latency_sum) / s.total_snapshots;
-            cout << "Latency avg (ms): " << fixed << setprecision(2) << avg << "\n";
-            cout << "Latency min (ms): " << s.latency_min << "\n";
-            cout << "Latency max (ms): " << s.latency_max << "\n";
-        }
-    };
-
-    print_stats("ABC", stats_abc);
-    print_stats("XYZ", stats_xyz);
-    print_stats("FOO", stats_foo);
-
-    g_stats.print_summary();
-
-    return 0;
+   cout << "Aggregator 종료." << endl;
+   return 0;
 }
