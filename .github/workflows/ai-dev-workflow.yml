@@ -13,7 +13,6 @@ on:
         default: 'review'
 
 env:
-  # Using Manus AI (OpenAI-compatible)
   OPENAI_API_KEY: ${{ secrets.MANUS_API_KEY }}
   OPENAI_API_BASE: https://api.manus.ai/v1
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -101,6 +100,49 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Analyze Project Context
+        id: context
+        run: |
+          echo "## Project Analysis" > /tmp/project-context.md
+          echo "" >> /tmp/project-context.md
+
+          # Check if repo has code
+          FILE_COUNT=$(find . -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.cpp" -o -name "*.c" -o -name "*.sol" \) | head -100 | wc -l)
+          echo "has_code=$([[ $FILE_COUNT -gt 0 ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+
+          echo "### Repository: ${{ github.repository }}" >> /tmp/project-context.md
+          echo "Code files found: $FILE_COUNT" >> /tmp/project-context.md
+          echo "" >> /tmp/project-context.md
+
+          # Include README
+          if [ -f README.md ]; then
+            echo "### README" >> /tmp/project-context.md
+            head -100 README.md >> /tmp/project-context.md
+            echo "" >> /tmp/project-context.md
+          fi
+
+          # Include package.json or similar
+          if [ -f package.json ]; then
+            echo "### package.json" >> /tmp/project-context.md
+            cat package.json >> /tmp/project-context.md
+          elif [ -f requirements.txt ]; then
+            echo "### requirements.txt" >> /tmp/project-context.md
+            cat requirements.txt >> /tmp/project-context.md
+          elif [ -f Cargo.toml ]; then
+            echo "### Cargo.toml" >> /tmp/project-context.md
+            cat Cargo.toml >> /tmp/project-context.md
+          elif [ -f go.mod ]; then
+            echo "### go.mod" >> /tmp/project-context.md
+            cat go.mod >> /tmp/project-context.md
+          fi
+          echo "" >> /tmp/project-context.md
+
+          # Directory structure
+          echo "### Project Structure" >> /tmp/project-context.md
+          find . -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.sol" \) | head -50 >> /tmp/project-context.md
+
+          cat /tmp/project-context.md
+
       - name: Setup Antfarm
         run: |
           git clone https://github.com/snarktank/antfarm.git /tmp/antfarm
@@ -109,7 +151,35 @@ jobs:
       - name: Run Bug Fix
         run: |
           cd ${{ github.workspace }}
-          antfarm workflow run bug-fix "Fix issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
+
+          CONTEXT=$(cat /tmp/project-context.md)
+          ISSUE_BODY="${{ github.event.issue.body }}"
+
+          if [ "${{ steps.context.outputs.has_code }}" == "true" ]; then
+            PROMPT="Fix issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
+
+Issue Description:
+$ISSUE_BODY
+
+IMPORTANT: This repository has existing code. You MUST:
+1. Analyze the existing codebase structure and patterns
+2. Follow the existing coding style, naming conventions, and architecture
+3. Use the same libraries/frameworks already in use
+4. Add tests if the project has tests
+5. Update documentation if needed
+
+Project Context:
+$CONTEXT"
+          else
+            PROMPT="Fix issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
+
+Issue Description:
+$ISSUE_BODY
+
+NOTE: This appears to be a new/empty repository. Create a proper project structure based on the repository name and issue requirements."
+          fi
+
+          antfarm workflow run bug-fix "$PROMPT"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.MANUS_API_KEY }}
@@ -125,6 +195,45 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Analyze Project Context
+        id: context
+        run: |
+          echo "## Project Analysis" > /tmp/project-context.md
+          echo "" >> /tmp/project-context.md
+
+          FILE_COUNT=$(find . -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.cpp" -o -name "*.c" -o -name "*.sol" \) | head -100 | wc -l)
+          echo "has_code=$([[ $FILE_COUNT -gt 0 ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+
+          echo "### Repository: ${{ github.repository }}" >> /tmp/project-context.md
+          echo "Code files found: $FILE_COUNT" >> /tmp/project-context.md
+          echo "" >> /tmp/project-context.md
+
+          if [ -f README.md ]; then
+            echo "### README" >> /tmp/project-context.md
+            head -100 README.md >> /tmp/project-context.md
+            echo "" >> /tmp/project-context.md
+          fi
+
+          if [ -f package.json ]; then
+            echo "### package.json" >> /tmp/project-context.md
+            cat package.json >> /tmp/project-context.md
+          elif [ -f requirements.txt ]; then
+            echo "### requirements.txt" >> /tmp/project-context.md
+            cat requirements.txt >> /tmp/project-context.md
+          elif [ -f Cargo.toml ]; then
+            echo "### Cargo.toml" >> /tmp/project-context.md
+            cat Cargo.toml >> /tmp/project-context.md
+          elif [ -f go.mod ]; then
+            echo "### go.mod" >> /tmp/project-context.md
+            cat go.mod >> /tmp/project-context.md
+          fi
+          echo "" >> /tmp/project-context.md
+
+          echo "### Project Structure" >> /tmp/project-context.md
+          find . -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.sol" \) | head -50 >> /tmp/project-context.md
+
+          cat /tmp/project-context.md
+
       - name: Setup Antfarm
         run: |
           git clone https://github.com/snarktank/antfarm.git /tmp/antfarm
@@ -133,7 +242,41 @@ jobs:
       - name: Run Feature Dev
         run: |
           cd ${{ github.workspace }}
-          antfarm workflow run feature-dev "Implement #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
+
+          CONTEXT=$(cat /tmp/project-context.md)
+          ISSUE_BODY="${{ github.event.issue.body }}"
+
+          if [ "${{ steps.context.outputs.has_code }}" == "true" ]; then
+            PROMPT="Implement feature #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
+
+Feature Request:
+$ISSUE_BODY
+
+IMPORTANT: This repository has existing code. You MUST:
+1. Analyze the existing codebase structure and patterns
+2. Follow the existing coding style, naming conventions, and architecture
+3. Use the same libraries/frameworks already in use
+4. Integrate seamlessly with existing code
+5. Add tests following the project's testing patterns
+6. Update documentation if needed
+
+Project Context:
+$CONTEXT"
+          else
+            PROMPT="Implement feature #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
+
+Feature Request:
+$ISSUE_BODY
+
+NOTE: This is a new/empty repository. Based on the repository name '${{ github.repository }}':
+1. Create a proper project structure
+2. Choose appropriate technology stack
+3. Implement the requested feature
+4. Add README with setup instructions
+5. Add basic tests"
+          fi
+
+          antfarm workflow run feature-dev "$PROMPT"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.MANUS_API_KEY }}
@@ -149,6 +292,25 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Analyze Project Context
+        run: |
+          echo "## Security Audit Context" > /tmp/project-context.md
+
+          if [ -f README.md ]; then
+            echo "### README" >> /tmp/project-context.md
+            head -50 README.md >> /tmp/project-context.md
+          fi
+
+          echo "### Project Structure" >> /tmp/project-context.md
+          find . -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.go" -o -name "*.sol" \) | head -50 >> /tmp/project-context.md
+
+          echo "### Dependencies" >> /tmp/project-context.md
+          [ -f package.json ] && cat package.json >> /tmp/project-context.md
+          [ -f requirements.txt ] && cat requirements.txt >> /tmp/project-context.md
+          [ -f Cargo.toml ] && cat Cargo.toml >> /tmp/project-context.md
+
+          cat /tmp/project-context.md
+
       - name: Setup Antfarm
         run: |
           git clone https://github.com/snarktank/antfarm.git /tmp/antfarm
@@ -157,7 +319,27 @@ jobs:
       - name: Run Security Audit
         run: |
           cd ${{ github.workspace }}
-          antfarm workflow run security-audit "Security #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
+
+          CONTEXT=$(cat /tmp/project-context.md)
+          ISSUE_BODY="${{ github.event.issue.body }}"
+
+          PROMPT="Security Audit for #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
+
+Issue Description:
+$ISSUE_BODY
+
+Audit the codebase for:
+1. OWASP Top 10 vulnerabilities
+2. Dependency vulnerabilities
+3. Secrets/credentials in code
+4. Injection vulnerabilities (SQL, XSS, Command)
+5. Authentication/Authorization issues
+6. Cryptographic weaknesses
+
+Project Context:
+$CONTEXT"
+
+          antfarm workflow run security-audit "$PROMPT"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.MANUS_API_KEY }}
